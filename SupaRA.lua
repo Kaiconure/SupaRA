@@ -1,4 +1,4 @@
-__version = '1.0.0'
+__version = '1.0.1'
 __name = 'SupaRA'
 __shortName = 'sra'
 __author = '@Kaiconure'
@@ -178,7 +178,7 @@ local function scheduler_iteration(t)
     -- Don't fire if we're still firing or haven't reached our spacing interval yet.
     if
         globals.in_ra or
-        t < (globals.last_ra + 3)--settings.interval) 
+        t < (globals.last_ra + settings.interval) 
     then
         return 0.5
     end
