@@ -1,4 +1,4 @@
-__version = '1.0.1'
+__version = '1.0.2'
 __name = 'SupaRA'
 __shortName = 'sra'
 __author = '@Kaiconure'
@@ -28,7 +28,7 @@ local STATUS_ENGAGED                    = 1
 
 local SPAWN_TYPE_MOB                    = 16
 
-local ANGLE_TOLERANCE                   = (10 * math.pi / 180.0)
+local ANGLE_TOLERANCE                   = (5 * math.pi / 180.0)
 local FORWARD_VECTOR                    = V({1, 0})
 
 local SLOT_RANGE    = 2
@@ -63,9 +63,11 @@ local BagsById =
 -- Persistent settings.
 --
 local DefaultSettings = {
-    interval = 3.0  -- This is really only here for experimentation purposes. Consider 3.0 to be the
-                    -- optimal, constant value. It's the amount of time to wait between one ranged
-                    -- attack completing and the next starting.
+    autoengage = false,     -- Whether to automatically engage with your target if not already engaged.
+    autotarget = false,     -- Whether to automatically find new targets when you don't already have one.
+    interval = 3.0          -- This is really only here for experimentation purposes. Consider 3.0 to be the
+                            -- optimal, constant value. It's the amount of time to wait between one ranged
+                            -- attack completing and the next starting.
 }
 
 local settings = config.load(DefaultSettings)
@@ -88,10 +90,20 @@ local function log(msg)
 end
 
 --
+-- Send a command and waits a given duration before returning.
+--
+local function send_command(command, wait)
+    windower.send_command(command)
+    if wait ~= nil then
+        coroutine.sleep(wait)
+    end
+end
+
+--
 -- Send a command back to this addon.
 --
 local function send_to_self(command)
-    windower.send_command('%s %s;':format(
+    send_command('%s %s;':format(
         __shortName,
         command
     ))
@@ -171,6 +183,92 @@ local function has_ranged_equipped()
 end
 
 --
+-- Lock the player onto the specified target.
+--
+local function set_target(player, target, unlock)
+    if player and target then
+        if 
+            target.valid_target and
+            target.hpp > 0
+        then
+            packets.inject(packets.new('incoming', 0x058, {
+                ['Player'] = player.id,
+                ['Target'] = target.id,
+                ['Player Index'] = player.index,
+            }))
+
+            -- if unlock then
+            --     coroutine.sleep(0.125)
+            --     windower.send_command('input /lockon off')
+            --     coroutine.sleep(0.125)
+            -- end
+
+            return true
+        end
+    end
+end
+
+--
+-- Finds the next target
+--
+local function set_next_target(player)
+    local mobs = windower.ffxi.get_mob_array()
+    local party = windower.ffxi.get_party()
+
+    -- Store a mapping of all party members by theid id, so we can easily
+    -- use this data later when trying to find viable targets
+    local party_by_id = {}
+    if party.p0 then party_by_id[party.p0.mob.id] = party.p0 end
+    if party.p1 then party_by_id[party.p1.mob.id] = party.p1 end
+    if party.p2 then party_by_id[party.p2.mob.id] = party.p2 end
+    if party.p3 then party_by_id[party.p3.mob.id] = party.p3 end
+    if party.p4 then party_by_id[party.p4.mob.id] = party.p4 end
+    if party.p5 then party_by_id[party.p5.mob.id] = party.p5 end
+
+    -- Our next target
+    local target = nil
+
+    for i, mob in pairs(mobs) do
+        
+        -- Verify that this mob is valid and within range
+        if 
+            mob.valid_target and
+            mob.spawn_type == SPAWN_TYPE_MOB and
+            mob.hpp > 0 and
+            mob.distance < (25 * 25)
+        then
+            -- Verify that the mob is unclaimed, or claimed a member of our party
+            if
+                mob.claim_id == 0 or
+                mob.claim_id == player.id or
+                party_by_id[mob.claim_id]
+            then
+                -- Determine if this is the best mob we've seen so far. We'll use it if:
+                --  1. We don't already have a mob being tracked, -OR-
+                --  2. The current mob is closer than what we already have.
+                -- Note: We will always take the nearest *aggroing* mob, if any. This is
+                -- to be sure we don't build a long train of mobs through autotargeting.
+                if
+                    target == nil or
+                    (mob.distance < target.distance and 
+                        (mob.status == STATUS_ENGAGED or target.status ~= STATUS_ENGAGED))
+                then
+                    target = mob
+                end
+            end
+        end
+    end
+
+    -- If we found a target, set it as the active target
+    if target then 
+        if set_target(player, target, true) then
+            log('Auto-targeting mob: %s (%03X)':format(target.name, target.index))
+            return target
+        end
+    end
+end
+
+--
 -- Execute one iteration of the ranged attack scheduler.
 --
 local function scheduler_iteration(t)
@@ -199,7 +297,7 @@ local function scheduler_iteration(t)
     end
 
     -- Only fire if we're targeting a valid, living mob
-    local target = windower.ffxi.get_mob_by_target('t')
+     local target = windower.ffxi.get_mob_by_target('t')
     if
         not target or
         not target.valid_target or
@@ -207,7 +305,15 @@ local function scheduler_iteration(t)
         target.spawn_type ~= SPAWN_TYPE_MOB or  -- It must be a valid, targetable mob
         target.distance > (25 * 25)             -- It must be in ranged attack range
     then
-        return
+        target = nil
+
+        if settings.autotarget then
+            target = set_next_target(player)
+        end
+
+        if target == nil then
+            return
+        end
     end
 
     -- Calculate some vectors between us and the target
@@ -221,8 +327,22 @@ local function scheduler_iteration(t)
     -- not actually function if we are target locked.
     local theta = vector_angle(vto)
     if math.abs(theta - me.heading) > ANGLE_TOLERANCE then
+
+        -- We can't turn if we're locked on to our target. We'll refresh the player object
+        -- to be sure we have the latest (retargeting could have changed this) and unlock.
+        player = windower.ffxi.get_player()
+        if player.target_locked then
+            send_command('input /lockon', 0.125)
+        end
+
+        -- Turn to face the target.
         windower.ffxi.turn(theta)
         coroutine.sleep(0.125)
+
+        -- If we were locked before, we'll re-lock now to put things back how they were.
+        if player.target_locked then
+            send_command('input /lockon', 0.125)
+        end
     end
     
     -- Finally, fire the shot
@@ -233,8 +353,21 @@ local function scheduler_iteration(t)
         return 2.0
     end
 
+    local command = ''
+
+    -- If autoengagement is set and we aren't engaged, set up the attack command
+    if 
+        settings.autoengage and
+        player.status ~= STATUS_ENGAGED
+    then
+        command = command .. 'input /attack <t>; wait 0.25;'
+    end
+
+    -- Add the ranged attack command
+    command = command .. 'input /ra <t>;'
+
     -- Finally, fire away
-    windower.send_command('input /ra <t>')
+    send_command(command, 0.125)
 end
 
 --
@@ -262,11 +395,19 @@ windower.register_event('load', function ()
 
     -- Bind Ctrl+D to the toggle command
     windower.send_command('bind ^d sra toggle')
+
+    -- Show current settings
+    send_to_self('show')
 end)
 
 windower.register_event('unload', function ()
     globals.kill = true
 end)
+
+local function iff(check, iftrue, iffalse)
+    if check then return iftrue end
+    return iffalse
+end
 
 --
 -- Addon command handler
@@ -293,9 +434,25 @@ windower.register_event('addon command', function (command, ...)
         log('Automatic ranged attack is running.')
         globals.paused = false
     elseif
-        command == 'show' 
+        command == 'autotarget'
     then
-        log('Automatic ranged attack is currently %s':format(globals.paused and 'paused' or 'running'))
+        settings.autotarget = iff(settings.autotarget, false, true)
+        settings:save()
+
+        send_to_self('show')
+    elseif
+        command == 'autoengage'
+    then
+        settings.autoengage = iff(settings.autoengage, false, true)
+        settings:save()
+
+        send_to_self('show')
+    elseif
+        command == 'show'
+    then
+        log('Current settings: ')
+        log('  autoengage: ' .. tostring(settings.autoengage))
+        log('  autotarget: ' .. tostring(settings.autotarget))
     elseif
         command == 'help'
     then
@@ -304,6 +461,10 @@ windower.register_event('addon command', function (command, ...)
         log('    supara <command> <arguments> -OR-')
         log('    sra <command> <arguments>')
         log('  Commands')
+        log('    autoengage: Toggles whether SupaRA should engage with your target.')
+        log('        Off by default. Saved to your settings.')
+        log('    autotarget: Toggles whether SupaRA should find new targets for you.')
+        log('        Off by default. Saved to your settings.')
         log('    show: Shows the current automation status.')
         log('    start: Starts the automatic ranged attack sequence.')
         log('    stop: Starts the automatic ranged attack sequence.')
